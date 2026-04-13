@@ -1215,3 +1215,61 @@ func TestCalculateDirSizeFastHighFanoutCompletes(t *testing.T) {
 		t.Fatalf("calculateDirSizeFast did not complete under high fan-out")
 	}
 }
+
+func TestScanPathConcurrentCapsAsyncSubdirScans(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+
+	const topLevelDirs = 96
+	const nestedDirs = 24
+
+	for i := range topLevelDirs {
+		for j := range nestedDirs {
+			nested := filepath.Join(root, fmt.Sprintf("dir-%03d", i), fmt.Sprintf("nested-%03d", j))
+			if err := os.MkdirAll(nested, 0o755); err != nil {
+				t.Fatalf("create nested dir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(nested, "data.bin"), []byte("x"), 0o644); err != nil {
+				t.Fatalf("write nested file: %v", err)
+			}
+		}
+	}
+
+	var activeAsync int64
+	var peakAsync int64
+	testScanHooks = scanTestHooks{
+		onAsyncSubdirStart: func(string) {
+			current := atomic.AddInt64(&activeAsync, 1)
+			for {
+				peak := atomic.LoadInt64(&peakAsync)
+				if current <= peak {
+					break
+				}
+				if atomic.CompareAndSwapInt64(&peakAsync, peak, current) {
+					break
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		},
+		onAsyncSubdirDone: func(string) {
+			atomic.AddInt64(&activeAsync, -1)
+		},
+	}
+	t.Cleanup(func() {
+		testScanHooks = scanTestHooks{}
+	})
+
+	var files, dirs, bytes int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	if _, err := scanPathConcurrent(root, &files, &dirs, &bytes, current); err != nil {
+		t.Fatalf("scanPathConcurrent(root): %v", err)
+	}
+
+	if peak := atomic.LoadInt64(&peakAsync); peak == 0 {
+		t.Fatalf("expected async subdir scans to run")
+	} else if peak > int64(scanWorkerLimit()) {
+		t.Fatalf("expected peak async subdir scans <= %d, got %d", scanWorkerLimit(), peak)
+	}
+}
